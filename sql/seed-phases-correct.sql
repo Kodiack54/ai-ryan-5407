@@ -170,8 +170,8 @@ WHERE pr1.slug = 'task' AND p1.name = 'Task definitions'
 -- ============================================
 -- TRADELINE
 -- ============================================
-INSERT INTO dev_tradelines (name, slug, status, port_number, server_path, droplet_ip, notes)
-VALUES ('Low Voltage', 'low-voltage', 'live', 3090, '/var/www/NextBid_Dev/engine', '161.35.229.220', 'First tradeline - working great')
+INSERT INTO dev_tradelines (name, slug, status, port_number, server_path, notes)
+VALUES ('Low Voltage', 'low-voltage', 'live', 3090, '/var/www/NextBid_Dev/engine', 'First tradeline - working great')
 ON CONFLICT (slug) DO UPDATE SET status = 'live', port_number = 3090;
 
 -- ============================================
