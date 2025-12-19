@@ -21,6 +21,11 @@ async function start() {
     process.exit(1);
   }
 
+  // Initialize TODO watcher service
+  const todoWatcher = require('./src/services/todoWatcher');
+  await todoWatcher.initialize();
+  logger.info('TODO watcher service started');
+
   // Load Express app
   const app = require('./src/routes');
 

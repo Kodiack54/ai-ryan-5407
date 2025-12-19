@@ -1,134 +1,193 @@
 /**
  * What's Next - Ryan's Priority Engine
- * The core intelligence for recommending next focus
+ * UPGRADED: Cross-client dependency awareness
  */
 const express = require('express');
 const router = express.Router();
 const { from } = require('../lib/db');
 
-// GET /api/whats-next - Get Ryan's recommendation
 router.get('/', async (req, res) => {
   try {
-    // 1. Get all phases with dependency info
-    const { data: phases, error: phaseErr } = await from('dev_phases_with_deps')
-      .select('*');
+    // 1. Get phases, projects, clients separately (no nested joins)
+    const { data: phases, error: phaseErr } = await from('dev_project_phases').select('*');
     if (phaseErr) throw phaseErr;
 
-    // 2. Get current focus (if any)
-    const { data: currentFocus } = await from('dev_current_focus')
-      .select('*, phase:dev_project_phases(name, status)')
-      .is('completed_at', null)
-      .order('priority')
-      .limit(1)
-      .single();
-
-    // 3. Get critical bugs
+    const { data: projects } = await from('dev_projects').select('*');
+    const { data: clients } = await from('dev_clients').select('*');
+    const { data: dependencies } = await from('dev_phase_dependencies').select('*');
     const { data: criticalBugs } = await from('dev_ai_bugs')
       .select('*')
       .eq('severity', 'critical')
       .in('status', ['open', 'investigating']);
-
-    // 4. Get tradelines in testing (need monitoring)
-    const { data: testingTradelines } = await from('dev_tradelines')
+    const { data: currentFocus } = await from('dev_current_focus')
       .select('*')
-      .eq('status', 'testing');
+      .is('completed_at', null)
+      .order('priority')
+      .limit(1);
 
-    // 5. Filter to actionable phases
-    const actionable = phases.filter(p => {
-      // Must be pending or in_progress
-      if (!['pending', 'in_progress'].includes(p.status)) return false;
-      // Must not be blocked
-      if (p.is_blocked) return false;
-      return true;
+    // Build lookup maps
+    const projectMap = {};
+    const clientMap = {};
+    (projects || []).forEach(p => { projectMap[p.id] = p; });
+    (clients || []).forEach(c => { clientMap[c.id] = c; });
+
+    // Enrich phases with project and client info
+    phases.forEach(phase => {
+      phase.project = projectMap[phase.project_id] || {};
+      phase.project.client = clientMap[phase.project?.client_id] || {};
     });
 
-    // 6. Score and rank phases
+    // Build phase map
+    const phaseMap = {};
+    phases.forEach(p => { phaseMap[p.id] = p; });
+
+    // Mark phases as blocked
+    phases.forEach(phase => {
+      phase.blockedBy = [];
+      phase.crossClientBlock = null;
+      
+      const phaseDeps = (dependencies || []).filter(d => d.phase_id === phase.id);
+      phaseDeps.forEach(dep => {
+        const blocker = phaseMap[dep.depends_on_phase_id];
+        if (blocker && blocker.status !== 'complete') {
+          phase.blockedBy.push({ phase: blocker, notes: dep.notes });
+          
+          if (blocker.project?.client_id !== phase.project?.client_id) {
+            phase.crossClientBlock = {
+              blockerPhase: blocker.name,
+              blockerProject: blocker.project?.name,
+              blockerClient: blocker.project?.client?.name || 'Unknown',
+              myClient: phase.project?.client?.name || 'Unknown',
+              notes: dep.notes
+            };
+          }
+        }
+      });
+      phase.is_blocked = phase.blockedBy.length > 0;
+    });
+
+    // Find phases that unblock other clients
+    phases.forEach(phase => {
+      phase.unblocksCrossClient = [];
+      const blocking = (dependencies || []).filter(d => d.depends_on_phase_id === phase.id);
+      blocking.forEach(dep => {
+        const blocked = phaseMap[dep.phase_id];
+        if (blocked && blocked.project?.client_id !== phase.project?.client_id) {
+          phase.unblocksCrossClient.push({
+            phase: blocked.name,
+            project: blocked.project?.name,
+            client: blocked.project?.client?.name
+          });
+        }
+      });
+    });
+
+    // Filter actionable
+    const actionable = phases.filter(p => 
+      ['pending', 'in_progress'].includes(p.status) && !p.is_blocked
+    );
+
+    // Score phases
     const scored = actionable.map(phase => {
       let score = 0;
       let reasons = [];
 
-      // In-progress phases get priority
+      if (phase.unblocksCrossClient.length > 0) {
+        score += 200;
+        const cls = [...new Set(phase.unblocksCrossClient.map(u => u.client))];
+        reasons.push(`🔓 UNBLOCKS ${cls.join(', ')} work`);
+      }
+
       if (phase.status === 'in_progress') {
         score += 100;
         reasons.push('Already in progress');
       }
 
-      // Phases that unblock others get priority
-      const unblocks = phases.filter(p => 
-        p.is_blocked && 
-        phases.some(blocker => blocker.id === phase.id)
+      const sameClientUnblocks = phases.filter(p => 
+        p.blockedBy.some(b => b.phase.id === phase.id) &&
+        p.project?.client_id === phase.project?.client_id
       ).length;
-      if (unblocks > 0) {
-        score += unblocks * 20;
-        reasons.push(`Unblocks ${unblocks} other phase(s)`);
+      if (sameClientUnblocks > 0) {
+        score += sameClientUnblocks * 20;
+        reasons.push(`Unblocks ${sameClientUnblocks} phase(s)`);
       }
 
-      // Active projects (Kodiack, Core, Engine, Portal, Sources) get priority
-      const activeProjects = ['kodiack', 'core', 'engine', 'portal', 'sources'];
-      if (activeProjects.some(p => phase.project_slug?.includes(p))) {
-        score += 10;
-        reasons.push('Active project');
+      if (phase.project?.slug === 'kodiack-dashboard-5500') {
+        score += 50;
+        reasons.push('🛠️ Studio tool needed');
       }
 
-      // Lower sort_order = earlier phase = higher priority
       score += Math.max(0, 10 - phase.sort_order);
 
-      return { ...phase, score, reasons };
+      return { ...phase, score, reasons, client_name: phase.project?.client?.name };
     });
 
-    // Sort by score descending
     scored.sort((a, b) => b.score - a.score);
 
-    // 7. Build recommendation
+    const crossClientBlocked = phases.filter(p => p.crossClientBlock);
     const topPick = scored[0];
     const alternatives = scored.slice(1, 4);
 
-    // 8. Check for blockers/warnings
     const warnings = [];
-    
     if (criticalBugs?.length > 0) {
       warnings.push({
         type: 'critical_bugs',
-        message: `${criticalBugs.length} critical bug(s) need attention`,
+        message: `⚠️ ${criticalBugs.length} critical bug(s) need attention`,
         items: criticalBugs.map(b => ({ id: b.id, title: b.title }))
       });
     }
 
-    if (testingTradelines?.length > 0) {
+    if (crossClientBlocked.length > 0) {
       warnings.push({
-        type: 'monitoring',
-        message: `${testingTradelines.length} tradeline(s) in testing - monitor before adding more`,
-        items: testingTradelines.map(t => ({ id: t.id, name: t.name }))
+        type: 'cross_client_blocked',
+        message: `🚫 ${crossClientBlocked.length} phase(s) waiting on another client's tools`,
+        items: crossClientBlocked.slice(0, 5).map(p => ({
+          blocked: `${p.project?.client?.name}: ${p.name}`,
+          waiting_on: `${p.crossClientBlock.blockerClient}: ${p.crossClientBlock.blockerPhase}`,
+          reason: p.crossClientBlock.notes
+        }))
       });
     }
 
-    // 9. Build response
     const recommendation = topPick ? {
-      project: topPick.project_name,
-      project_slug: topPick.project_slug,
+      project: topPick.project?.name,
+      project_slug: topPick.project?.slug,
+      client: topPick.client_name,
       phase: topPick.name,
       phase_id: topPick.id,
       status: topPick.status,
       score: topPick.score,
       reasons: topPick.reasons,
-      description: topPick.description
+      description: topPick.description,
+      unblocks_clients: topPick.unblocksCrossClient
     } : null;
+
+    let actionMessage = null;
+    if (topPick?.unblocksCrossClient?.length > 0) {
+      const unblocked = topPick.unblocksCrossClient[0];
+      actionMessage = `Complete "${topPick.name}" (${topPick.client_name}) → Then work on "${unblocked.phase}" (${unblocked.client})`;
+    }
 
     res.json({
       success: true,
+      action_message: actionMessage,
       recommendation,
       alternatives: alternatives.map(a => ({
-        project: a.project_name,
+        project: a.project?.name,
+        client: a.client_name,
         phase: a.name,
         phase_id: a.id,
-        score: a.score
+        score: a.score,
+        reasons: a.reasons
       })),
-      current_focus: currentFocus,
+      current_focus: currentFocus?.[0] || null,
       warnings,
+      cross_client_dependencies: crossClientBlocked.length,
       summary: {
         total_phases: phases.length,
         actionable: actionable.length,
         blocked: phases.filter(p => p.is_blocked).length,
+        cross_client_blocked: crossClientBlocked.length,
         in_progress: phases.filter(p => p.status === 'in_progress').length,
         complete: phases.filter(p => p.status === 'complete').length
       }
@@ -139,78 +198,42 @@ router.get('/', async (req, res) => {
   }
 });
 
-// POST /api/complete - Mark current focus as complete, get next
 router.post('/complete', async (req, res) => {
   try {
-    const { phase_id, notes } = req.body;
-
-    // 1. Mark current focus as completed
+    const { phase_id } = req.body;
     if (phase_id) {
       await from('dev_current_focus')
         .update({ completed_at: new Date().toISOString() })
         .eq('phase_id', phase_id)
         .is('completed_at', null);
-
-      // 2. Mark the phase itself as complete
       await from('dev_project_phases')
-        .update({ 
-          status: 'complete',
-          completed_at: new Date().toISOString(),
-          updated_at: new Date().toISOString()
-        })
+        .update({ status: 'complete', completed_at: new Date().toISOString() })
         .eq('id', phase_id);
     }
-
-    // 3. Get next recommendation (call whats-next logic)
-    // Redirect to GET /api/whats-next
     res.redirect(307, '/api/whats-next');
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// POST /api/focus - Set current focus
 router.post('/focus', async (req, res) => {
   try {
     const { phase_id, rationale } = req.body;
+    if (!phase_id) return res.status(400).json({ success: false, error: 'phase_id required' });
 
-    if (!phase_id) {
-      return res.status(400).json({ success: false, error: 'phase_id is required' });
-    }
+    const { data: phase } = await from('dev_project_phases').select('*').eq('id', phase_id).single();
+    if (!phase) return res.status(404).json({ success: false, error: 'Phase not found' });
 
-    // Get phase info
-    const { data: phase } = await from('dev_project_phases')
-      .select('*, project:dev_projects(id, name)')
-      .eq('id', phase_id)
-      .single();
-
-    if (!phase) {
-      return res.status(404).json({ success: false, error: 'Phase not found' });
-    }
-
-    // Mark phase as in_progress
     await from('dev_project_phases')
-      .update({ 
-        status: 'in_progress',
-        started_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
-      })
+      .update({ status: 'in_progress', started_at: new Date().toISOString() })
       .eq('id', phase_id);
 
-    // Create focus record
     const { data: focus, error } = await from('dev_current_focus')
-      .insert({
-        project_id: phase.project.id,
-        phase_id,
-        priority: 1,
-        rationale: rationale || `Focus set on ${phase.name}`,
-        set_by: 'user'
-      })
+      .insert({ project_id: phase.project_id, phase_id, priority: 1, rationale: rationale || `Focus on ${phase.name}`, set_by: 'user' })
       .select()
       .single();
 
     if (error) throw error;
-
     res.json({ success: true, focus, phase });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });

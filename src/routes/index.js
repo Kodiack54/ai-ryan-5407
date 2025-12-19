@@ -20,6 +20,8 @@ app.use('/api', require('./phases'));              // /api/project/:id/phases, /
 app.use('/api', require('./dependencies'));        // /api/dependency, /api/blocked
 app.use('/api/tradelines', require('./tradelines'));
 app.use('/api/briefing', require('./briefing'));
+app.use('/api/todos', require('./todos'));
+app.use('/api/roadmap', require('./roadmap'));
 
 // 404 handler
 app.use((req, res) => {
